@@ -10,6 +10,8 @@ use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -270,7 +272,13 @@ impl<'a> Exporter<'a> {
         fs::rename(temp_path, real_path).unwrap();
     }
 
-    fn live_capture(&self, opts: &ExporterOptions) -> Result<(), Box<dyn Error>> {
+    fn live_capture(
+        &self,
+        opts: &ExporterOptions,
+        running: Arc<AtomicBool>,
+    ) -> Result<(), Box<dyn Error>> {
+        fs::create_dir_all(&opts.datadir).unwrap();
+
         let ipv4_mask = Ipv4PortMask::new(get_seed(opts));
         let port_mask = PortMask::new(get_seed(opts));
         let mut capture = Capture::from_device(opts.device.clone())?
@@ -296,6 +304,15 @@ impl<'a> Exporter<'a> {
         last_write -= Duration::from_millis(self.metrics_update_interval_ms);
 
         while let Ok(packet) = capture.next_packet() {
+            // This part should be as fast as possible. It was triggered by the user requesting the
+            // program to stop.
+            if !running.load(Ordering::SeqCst) {
+                if let Some(savefile) = &mut savefile {
+                    let _ = savefile.flush();
+                }
+                break;
+            }
+
             println!("received packet!");
             let Ok(val) = SlicedPacket::from_ethernet(packet.data) else {
                 println!("Can't parse ethernet");
@@ -398,12 +415,35 @@ impl<'a> Exporter<'a> {
     }
 }
 
-fn run_exporter(opts: &ExporterOptions) -> Result<(), Box<dyn Error>> {
+fn run_exporter(opts: &ExporterOptions, running: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
     let exporter = Exporter::new(&opts.datadir, &opts.extra_labels);
 
-    exporter.live_capture(opts)?;
+    exporter.live_capture(opts, running)?;
 
     Ok(())
+}
+
+/// Adds a Ctrl+C handler that changes the "running" variable to false when the
+/// signal is received. This variable can be shared by other parts of the code,
+/// in order to handle exiting gracefully. The second Ctrl+C generates an exit.
+fn set_ctrlc_handler(running: &Arc<AtomicBool>) {
+    let state = Arc::new(AtomicUsize::new(0));
+    let state_clone = state.clone();
+    let running_clone = running.clone();
+
+    ctrlc::set_handler(move || {
+        let previous_state = state_clone.fetch_add(1, Ordering::SeqCst);
+
+        if previous_state == 0 {
+            println!("Initiating graceful shutdown... Press Ctrl+C again to force quit.");
+        } else {
+            println!("Force quit triggered. Exiting immediately.");
+            std::process::exit(1); // Bypasses all Drop handlers and flushes
+        }
+
+        running_clone.store(false, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl-C handler");
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -419,8 +459,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(opts.unwrap_err());
     };
 
+    let running = Arc::new(AtomicBool::new(true));
+    set_ctrlc_handler(&running);
+
     let exporter_thread = thread::spawn(move || {
-        let _ = run_exporter(&opts);
+        let _ = run_exporter(&opts, running);
     });
     let _ = exporter_thread.join();
 
