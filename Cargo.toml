@@ -4,10 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+aes = "0.8.4"
 axum = "0.8.8"
 clap = { version = "4.5.59", features = ["derive"] }
+cts = "0.6.0"
 etherparse = "0.19.0"
+getrandom = "0.4.1"
+hmac = "0.12.1"
 pcap = "2.4.0"
 prometheus = "0.14.0"
+sha2 = "0.10.9"
+speck-cipher = "0.0.1"
 tokio = { version = "1.49.0", features = ["full", "rt"] }
 tower-http = { version = "0.6.8", features = ["fs"] }
