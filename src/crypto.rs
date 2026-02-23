@@ -52,7 +52,7 @@ pub fn permute_48_speck48_96(key: &[u8], data: [u8; 6]) -> [u8; 6] {
 }
 
 pub fn aes256_ecb(key: &[u8], data: &[u8]) -> Vec<u8> {
-    if data.len().is_multiple_of(16) {
+    if !data.len().is_multiple_of(16) {
         panic!("ECB can only encrypt messages whose length that are multiple of block length");
     }
     let key: [u8; 32] = key.try_into().expect("Wrong AES key length");
