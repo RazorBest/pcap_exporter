@@ -5,10 +5,13 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::fs::File;
+use std::io;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -18,7 +21,7 @@ use etherparse::{
     SlicedPacket,
     TransportSlice::Tcp,
 };
-use pcap::{Capture, Device};
+use pcap::{Capture, Device, Savefile};
 use prometheus::{
     Encoder, IntCounterVec, Opts, Registry, TextEncoder,
     core::{MetricVec, MetricVecBuilder},
@@ -30,7 +33,8 @@ use crate::mask::{Ipv4PortMask, PortMask, Seed};
 const CAPTURE_BUFFER_SIZE_BYTES: i32 = 10000000;
 const DEFAULT_DATADIR: &str = "./data";
 const HTML_DIR: &str = "html";
-const SEED_FILE: &str = ".seed";
+const SEED_FILE: &str = "seed";
+const PCAP_FILE: &str = "captured.pcap";
 const DEFAULT_METRICS_UPDATE_INTERVAL_MS: u64 = 100;
 
 #[derive(Parser)]
@@ -61,10 +65,23 @@ struct CliOptions {
     /// Manually maps IP1 to IP2 before serializing them. These IPs skip the mask_ip_ports option.
     #[arg(long, value_parser = parse_key_val_ip)]
     map_ips: Vec<(String, String)>,
+
+    /// Store the captured packets in pcap files in the data directory
+    #[arg(long, default_value_t = false)]
+    dump_pcap: bool,
+
+    /// Adds the constant LABEL=VALUE to all the metrics
+    #[arg(long = "add-label", value_parser = parse_key_val_label)]
+    extra_labels: Vec<(String, String)>,
 }
 
 fn parse_key_val_ip(s: &str) -> Result<(String, String), String> {
     let (k, v) = s.split_once('=').ok_or("expected IP1=IP2")?;
+    Ok((k.to_string(), v.to_string()))
+}
+
+fn parse_key_val_label(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s.split_once('=').ok_or("expected LABEL=VALUE")?;
     Ok((k.to_string(), v.to_string()))
 }
 
@@ -75,6 +92,8 @@ struct ExporterOptions {
     datadir: PathBuf,
     mask_ip_ports: bool,
     map_ips: HashMap<IpAddr, IpAddr>,
+    dump_pcap: bool,
+    extra_labels: Vec<(String, String)>,
 }
 
 fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error>> {
@@ -117,6 +136,8 @@ fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error
         datadir,
         mask_ip_ports: args.mask_ip_ports,
         map_ips,
+        dump_pcap: args.dump_pcap,
+        extra_labels: args.extra_labels.clone(),
     })
 }
 
@@ -164,6 +185,7 @@ fn get_counter<T: MetricVecBuilder>(
     src_port: u16,
     dst_ip: String,
     dst_port: u16,
+    extra_labels: &[(String, String)],
 ) -> T::M {
     let labels: HashMap<_, _> = [
         ("src_ip", src_ip),
@@ -172,9 +194,34 @@ fn get_counter<T: MetricVecBuilder>(
         ("dst_port", dst_port.to_string()),
     ]
     .into_iter()
+    .chain(
+        extra_labels
+            .iter()
+            .map(|(label, value)| (&label[..], value.clone())),
+    )
     .collect();
 
     generic_counter.with(&labels)
+}
+
+fn get_capture_savefile<T: pcap::State + ?Sized + pcap::Activated>(
+    capture: &Capture<T>,
+    pcap_path: &Path,
+) -> Result<Savefile, Box<dyn Error>> {
+    {
+        let res = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(pcap_path);
+
+        match res {
+            // Throw the error if it's not AlreadyExists
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
+            _ => Ok(()),
+        }?
+    }
+
+    Ok(capture.savefile_append(pcap_path)?)
 }
 
 struct Exporter<'a> {
@@ -185,11 +232,14 @@ struct Exporter<'a> {
 }
 
 impl<'a> Exporter<'a> {
-    fn new(datadir: &'a Path) -> Self {
+    fn new(datadir: &'a Path, extra_labels: &[(String, String)]) -> Self {
         let counter_opts = Opts::new("ntm_bytes", "packet bytes counter");
+        let ntm_bytes_labels: Vec<&str> = ["src_ip", "dst_ip", "src_port", "dst_port"]
+            .into_iter()
+            .chain(extra_labels.iter().map(|(key, _)| &key[..]))
+            .collect();
         let ntm_bytes_generic_counter =
-            IntCounterVec::new(counter_opts, &["src_ip", "dst_ip", "src_port", "dst_port"])
-                .unwrap();
+            IntCounterVec::new(counter_opts, &ntm_bytes_labels).unwrap();
 
         let registry = Registry::new();
         registry
@@ -222,7 +272,13 @@ impl<'a> Exporter<'a> {
         fs::rename(temp_path, real_path).unwrap();
     }
 
-    fn live_capture(&self, opts: &ExporterOptions) -> Result<(), Box<dyn Error>> {
+    fn live_capture(
+        &self,
+        opts: &ExporterOptions,
+        running: Arc<AtomicBool>,
+    ) -> Result<(), Box<dyn Error>> {
+        fs::create_dir_all(&opts.datadir).unwrap();
+
         let ipv4_mask = Ipv4PortMask::new(get_seed(opts));
         let port_mask = PortMask::new(get_seed(opts));
         let mut capture = Capture::from_device(opts.device.clone())?
@@ -231,83 +287,84 @@ impl<'a> Exporter<'a> {
             .buffer_size(CAPTURE_BUFFER_SIZE_BYTES)
             .open()?;
 
+        // ATTENTION: Apply the filter as soon as possible
         if let Some(bpf) = &opts.bpf {
             capture.filter(bpf, true)?;
         }
 
+        let mut savefile = if opts.dump_pcap {
+            let pcap_path = opts.datadir.join(PCAP_FILE);
+            Some(get_capture_savefile(&capture, &pcap_path).unwrap())
+        } else {
+            None
+        };
+
         let mut last_write = get_time();
-        // Subtract so we immediately force a write
+        // Subtract to immediately force a write
         last_write -= Duration::from_millis(self.metrics_update_interval_ms);
 
-        println!("Starting capture");
-
         while let Ok(packet) = capture.next_packet() {
+            // This part should be as fast as possible. It was triggered by the user requesting the
+            // program to stop.
+            if !running.load(Ordering::SeqCst) {
+                if let Some(savefile) = &mut savefile {
+                    let _ = savefile.flush();
+                }
+                break;
+            }
+
             println!("received packet!");
-            if let Ok(val) = SlicedPacket::from_ethernet(packet.data) {
-                let Some(Tcp(tcp)) = val.transport else {
-                    continue;
-                };
+            let Ok(val) = SlicedPacket::from_ethernet(packet.data) else {
+                println!("Can't parse ethernet");
+                continue;
+            };
+            let Some(Tcp(tcp)) = val.transport else {
+                continue;
+            };
 
-                let (src_ip, src_port, dst_ip, dst_port) = match val.net {
-                    Some(Ipv4(ip)) => {
-                        let src_port = tcp.source_port();
-                        let dst_port = tcp.destination_port();
+            if let Some(savefile) = &mut savefile {
+                savefile.write(&packet);
+            }
 
-                        let header = ip.header();
-                        if opts.mask_ip_ports {
-                            let src_ip = header.source_addr();
-                            let dst_ip = header.destination_addr();
+            let (src_ip, src_port, dst_ip, dst_port) = match val.net {
+                Some(Ipv4(ip)) => {
+                    let src_port = tcp.source_port();
+                    let dst_port = tcp.destination_port();
 
-                            let (mut masked_src_ip, mut masked_src_port) = (src_ip, src_port);
-                            if let Some(IpAddr::V4(mapped_ip)) =
-                                opts.map_ips.get(&IpAddr::from(src_ip))
-                            {
-                                masked_src_ip = *mapped_ip;
-                                if opts.mask_ip_ports {
-                                    masked_src_port = port_mask.apply(src_port);
-                                }
-                            } else if opts.mask_ip_ports {
-                                (masked_src_ip, masked_src_port) =
-                                    ipv4_mask.apply(src_ip, src_port);
+                    let header = ip.header();
+                    if opts.mask_ip_ports {
+                        let src_ip = header.source_addr();
+                        let dst_ip = header.destination_addr();
+
+                        let (mut masked_src_ip, mut masked_src_port) = (src_ip, src_port);
+                        if let Some(IpAddr::V4(mapped_ip)) = opts.map_ips.get(&IpAddr::from(src_ip))
+                        {
+                            masked_src_ip = *mapped_ip;
+                            if opts.mask_ip_ports {
+                                masked_src_port = port_mask.apply(src_port);
                             }
-
-                            let (mut masked_dst_ip, mut masked_dst_port) = (dst_ip, dst_port);
-                            if let Some(IpAddr::V4(mapped_ip)) =
-                                opts.map_ips.get(&IpAddr::from(dst_ip))
-                            {
-                                masked_dst_ip = *mapped_ip;
-                                if opts.mask_ip_ports {
-                                    masked_dst_port = port_mask.apply(dst_port);
-                                }
-                            } else if opts.mask_ip_ports {
-                                (masked_dst_ip, masked_dst_port) =
-                                    ipv4_mask.apply(dst_ip, dst_port);
-                            }
-
-                            (
-                                masked_src_ip.to_string(),
-                                masked_src_port,
-                                masked_dst_ip.to_string(),
-                                masked_dst_port,
-                            )
-                        } else {
-                            (
-                                header.source_addr().to_string(),
-                                src_port,
-                                header.destination_addr().to_string(),
-                                dst_port,
-                            )
-                        }
-                    }
-                    Some(Ipv6(ip)) => {
-                        let src_port = tcp.source_port();
-                        let dst_port = tcp.destination_port();
-
-                        let header = ip.header();
-                        if opts.mask_ip_ports {
-                            panic!("Mask not supported for IPv6");
+                        } else if opts.mask_ip_ports {
+                            (masked_src_ip, masked_src_port) = ipv4_mask.apply(src_ip, src_port);
                         }
 
+                        let (mut masked_dst_ip, mut masked_dst_port) = (dst_ip, dst_port);
+                        if let Some(IpAddr::V4(mapped_ip)) = opts.map_ips.get(&IpAddr::from(dst_ip))
+                        {
+                            masked_dst_ip = *mapped_ip;
+                            if opts.mask_ip_ports {
+                                masked_dst_port = port_mask.apply(dst_port);
+                            }
+                        } else if opts.mask_ip_ports {
+                            (masked_dst_ip, masked_dst_port) = ipv4_mask.apply(dst_ip, dst_port);
+                        }
+
+                        (
+                            masked_src_ip.to_string(),
+                            masked_src_port,
+                            masked_dst_ip.to_string(),
+                            masked_dst_port,
+                        )
+                    } else {
                         (
                             header.source_addr().to_string(),
                             src_port,
@@ -315,19 +372,42 @@ impl<'a> Exporter<'a> {
                             dst_port,
                         )
                     }
-                    _ => {
-                        continue;
-                    }
-                };
-
-                let cnt_bytes = get_counter(&self.ntm_bytes, src_ip, src_port, dst_ip, dst_port);
-                cnt_bytes.inc_by(tcp.payload().len() as u64);
-
-                let curr_time = get_time();
-                if curr_time - last_write > Duration::from_millis(self.metrics_update_interval_ms) {
-                    self.write_metrics();
-                    last_write = curr_time;
                 }
+                Some(Ipv6(ip)) => {
+                    let src_port = tcp.source_port();
+                    let dst_port = tcp.destination_port();
+
+                    let header = ip.header();
+                    if opts.mask_ip_ports {
+                        panic!("Mask not supported for IPv6");
+                    }
+
+                    (
+                        header.source_addr().to_string(),
+                        src_port,
+                        header.destination_addr().to_string(),
+                        dst_port,
+                    )
+                }
+                _ => {
+                    continue;
+                }
+            };
+
+            let cnt_bytes = get_counter(
+                &self.ntm_bytes,
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port,
+                &opts.extra_labels,
+            );
+            cnt_bytes.inc_by(tcp.payload().len() as u64);
+
+            let curr_time = get_time();
+            if curr_time - last_write >= Duration::from_millis(self.metrics_update_interval_ms) {
+                self.write_metrics();
+                last_write = curr_time;
             }
         }
 
@@ -335,12 +415,35 @@ impl<'a> Exporter<'a> {
     }
 }
 
-fn run_exporter(opts: &ExporterOptions) -> Result<(), Box<dyn Error>> {
-    let exporter = Exporter::new(&opts.datadir);
+fn run_exporter(opts: &ExporterOptions, running: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
+    let exporter = Exporter::new(&opts.datadir, &opts.extra_labels);
 
-    exporter.live_capture(opts)?;
+    exporter.live_capture(opts, running)?;
 
     Ok(())
+}
+
+/// Adds a Ctrl+C handler that changes the "running" variable to false when the
+/// signal is received. This variable can be shared by other parts of the code,
+/// in order to handle exiting gracefully. The second Ctrl+C generates an exit.
+fn set_ctrlc_handler(running: &Arc<AtomicBool>) {
+    let state = Arc::new(AtomicUsize::new(0));
+    let state_clone = state.clone();
+    let running_clone = running.clone();
+
+    ctrlc::set_handler(move || {
+        let previous_state = state_clone.fetch_add(1, Ordering::SeqCst);
+
+        if previous_state == 0 {
+            println!("Initiating graceful shutdown... Press Ctrl+C again to force quit.");
+        } else {
+            println!("Force quit triggered. Exiting immediately.");
+            std::process::exit(1); // Bypasses all Drop handlers and flushes
+        }
+
+        running_clone.store(false, Ordering::SeqCst);
+    })
+    .expect("Error setting Ctrl-C handler");
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -356,8 +459,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         return Err(opts.unwrap_err());
     };
 
+    let running = Arc::new(AtomicBool::new(true));
+    set_ctrlc_handler(&running);
+
     let exporter_thread = thread::spawn(move || {
-        let _ = run_exporter(&opts);
+        let _ = run_exporter(&opts, running);
     });
     let _ = exporter_thread.join();
 

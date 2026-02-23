@@ -7,6 +7,7 @@ edition = "2024"
 aes = "0.8.4"
 axum = "0.8.8"
 clap = { version = "4.5.59", features = ["derive"] }
+ctrlc = "3.5.2"
 cts = "0.6.0"
 etherparse = "0.19.0"
 getrandom = "0.4.1"
@@ -17,3 +18,6 @@ sha2 = "0.10.9"
 speck-cipher = "0.0.1"
 tokio = { version = "1.49.0", features = ["full", "rt"] }
 tower-http = { version = "0.6.8", features = ["fs"] }
+
+[build-dependencies]
+pkg-config = "0.3.32"
