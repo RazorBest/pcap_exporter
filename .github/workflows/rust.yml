@@ -16,7 +16,7 @@ jobs:
 
     steps:
     - name: Install dependencies
-      run:|
+      run: |
         sudo apt-get update
         sudo apt-get install -y libpcap-dev
     - uses: actions/checkout@v4
