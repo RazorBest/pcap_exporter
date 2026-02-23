@@ -1,6 +1,6 @@
 use core::net::Ipv4Addr;
 
-use crate::crypto::{aes256_ecb, hmac256, permute_48_speck48_96, SecretKeyHmac};
+use crate::crypto::{SecretKeyHmac, aes256_ecb, hmac256, permute_48_speck48_96};
 
 pub type Seed = [u8; 64];
 
@@ -31,7 +31,10 @@ impl Ipv4PortMask {
         }
 
         // HKDF-Extract step from RFC 5869
-        let prk = SecretKeyHmac::new(hmac256(&SecretKeyHmac::new(b"PcapExport_Ipv4PortMask".to_vec()), &seed));
+        let prk = SecretKeyHmac::new(hmac256(
+            &SecretKeyHmac::new(b"PcapExport_Ipv4PortMask".to_vec()),
+            &seed,
+        ));
 
         let mut key_data = vec![];
 
@@ -44,7 +47,7 @@ impl Ipv4PortMask {
         t1.fill(0);
 
         Ipv4PortMaskKey {
-            key: key_data.try_into().unwrap()
+            key: key_data.try_into().unwrap(),
         }
     }
 
@@ -74,7 +77,9 @@ impl PortMask {
     pub fn new(seed: Seed) -> Self {
         let key = Self::derive_key(seed);
 
-        Self { map: Self::compute_map(key) }
+        Self {
+            map: Self::compute_map(key),
+        }
     }
 
     /// Derives the secret key used by this class instance, given a seed.
@@ -86,7 +91,10 @@ impl PortMask {
         }
 
         // HKDF-Extract step from RFC 5869
-        let prk = SecretKeyHmac::new(hmac256(&SecretKeyHmac::new(b"PcapExport_PortMask".to_vec()), &seed));
+        let prk = SecretKeyHmac::new(hmac256(
+            &SecretKeyHmac::new(b"PcapExport_PortMask".to_vec()),
+            &seed,
+        ));
 
         let mut key_data = vec![];
 
@@ -99,7 +107,7 @@ impl PortMask {
         t1.fill(0);
 
         PortMaskKey {
-            key: key_data.try_into().unwrap()
+            key: key_data.try_into().unwrap(),
         }
     }
 
@@ -120,13 +128,14 @@ impl PortMask {
             panic!("Slices do not divide by 16");
         };
 
-        let mut enc_pairs: Vec<_> = chunks.into_iter()
+        let mut enc_pairs: Vec<_> = chunks
+            .into_iter()
             .enumerate()
             .map(|(i, block)| (block, i as u16))
             .collect();
 
         enc_pairs.sort();
-        
+
         let map: Vec<_> = enc_pairs.into_iter().map(|(_, i)| i).collect();
 
         map

@@ -65,9 +65,7 @@ struct CliOptions {
 }
 
 fn parse_key_val_ip(s: &str) -> Result<(String, String), String> {
-    let (k, v) = s
-        .split_once('=')
-        .ok_or("expected IP1=IP2")?;
+    let (k, v) = s.split_once('=').ok_or("expected IP1=IP2")?;
     Ok((k.to_string(), v.to_string()))
 }
 
@@ -99,7 +97,9 @@ fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error
     let mut datadir = PathBuf::new();
     datadir.push(&args.datadir);
 
-    let map_ips: HashMap<_, _> = args.map_ips.iter()
+    let map_ips: HashMap<_, _> = args
+        .map_ips
+        .iter()
         .map(|(ip1, ip2)| {
             let parsed1 = IpAddr::from_str(ip1).map_err(|_| "IP parse error")?;
             let parsed2 = IpAddr::from_str(ip2).map_err(|_| "IP parse error")?;
@@ -126,7 +126,9 @@ fn get_seed(opts: &ExporterOptions) -> Seed {
     let seed_path = opts.datadir.join(SEED_FILE);
 
     if let Ok(data) = fs::read(&seed_path) {
-        return data.try_into().expect("Seed read from file has wrong format");
+        return data
+            .try_into()
+            .expect("Seed read from file has wrong format");
     }
 
     let mut seed: Seed = [0u8; 64];
@@ -258,25 +260,31 @@ impl<'a> Exporter<'a> {
                             let dst_ip = header.destination_addr();
 
                             let (mut masked_src_ip, mut masked_src_port) = (src_ip, src_port);
-                            if let Some(IpAddr::V4(mapped_ip)) = opts.map_ips.get(&IpAddr::from(src_ip)) {
+                            if let Some(IpAddr::V4(mapped_ip)) =
+                                opts.map_ips.get(&IpAddr::from(src_ip))
+                            {
                                 masked_src_ip = *mapped_ip;
                                 if opts.mask_ip_ports {
                                     masked_src_port = port_mask.apply(src_port);
                                 }
                             } else if opts.mask_ip_ports {
-                                (masked_src_ip, masked_src_port) = ipv4_mask.apply(src_ip, src_port);
+                                (masked_src_ip, masked_src_port) =
+                                    ipv4_mask.apply(src_ip, src_port);
                             }
 
                             let (mut masked_dst_ip, mut masked_dst_port) = (dst_ip, dst_port);
-                            if let Some(IpAddr::V4(mapped_ip)) = opts.map_ips.get(&IpAddr::from(dst_ip)) {
+                            if let Some(IpAddr::V4(mapped_ip)) =
+                                opts.map_ips.get(&IpAddr::from(dst_ip))
+                            {
                                 masked_dst_ip = *mapped_ip;
                                 if opts.mask_ip_ports {
                                     masked_dst_port = port_mask.apply(dst_port);
                                 }
                             } else if opts.mask_ip_ports {
-                                (masked_dst_ip, masked_dst_port) = ipv4_mask.apply(dst_ip, dst_port);
+                                (masked_dst_ip, masked_dst_port) =
+                                    ipv4_mask.apply(dst_ip, dst_port);
                             }
-                            
+
                             (
                                 masked_src_ip.to_string(),
                                 masked_src_port,
@@ -290,9 +298,7 @@ impl<'a> Exporter<'a> {
                                 header.destination_addr().to_string(),
                                 dst_port,
                             )
-
                         }
-
                     }
                     Some(Ipv6(ip)) => {
                         let src_port = tcp.source_port();
@@ -315,13 +321,7 @@ impl<'a> Exporter<'a> {
                     }
                 };
 
-                let cnt_bytes = get_counter(
-                    &self.ntm_bytes,
-                    src_ip,
-                    src_port,
-                    dst_ip,
-                    dst_port,
-                );
+                let cnt_bytes = get_counter(&self.ntm_bytes, src_ip, src_port, dst_ip, dst_port);
                 cnt_bytes.inc_by(tcp.payload().len() as u64);
 
                 let curr_time = get_time();

@@ -1,7 +1,7 @@
 use aes::{Aes128, Aes256};
 use cts::{Encrypt, KeyIvInit};
-use sha2::Sha256;
 use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use speck_cipher::Speck48_96;
 use speck_cipher::cipher::{BlockEncrypt, KeyInit};
 
@@ -18,7 +18,8 @@ impl SecretKeyHmac {
 }
 
 pub fn hmac256(key: &SecretKeyHmac, data: &[u8]) -> Vec<u8> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&key.data).expect("HMAC can take key of any size");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(&key.data).expect("HMAC can take key of any size");
     mac.update(data);
 
     mac.finalize().into_bytes()[..].to_vec()
@@ -58,7 +59,7 @@ pub fn aes256_ecb(key: &[u8], data: &[u8]) -> Vec<u8> {
 
     let mut enc = data.to_vec();
     for i in (0..data.len()).step_by(16) {
-        cipher.encrypt_block((&mut enc[i..i+16]).into());
+        cipher.encrypt_block((&mut enc[i..i + 16]).into());
     }
 
     enc
