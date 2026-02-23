@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::error::Error;
 use std::fs;
 use std::fs::File;
+use std::io;
 use std::io::Write;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -18,7 +19,7 @@ use etherparse::{
     SlicedPacket,
     TransportSlice::Tcp,
 };
-use pcap::{Capture, Device};
+use pcap::{Capture, Device, Savefile};
 use prometheus::{
     Encoder, IntCounterVec, Opts, Registry, TextEncoder,
     core::{MetricVec, MetricVecBuilder},
@@ -30,7 +31,8 @@ use crate::mask::{Ipv4PortMask, PortMask, Seed};
 const CAPTURE_BUFFER_SIZE_BYTES: i32 = 10000000;
 const DEFAULT_DATADIR: &str = "./data";
 const HTML_DIR: &str = "html";
-const SEED_FILE: &str = ".seed";
+const SEED_FILE: &str = "seed";
+const PCAP_FILE: &str = "captured.pcap";
 const DEFAULT_METRICS_UPDATE_INTERVAL_MS: u64 = 100;
 
 #[derive(Parser)]
@@ -61,6 +63,10 @@ struct CliOptions {
     /// Manually maps IP1 to IP2 before serializing them. These IPs skip the mask_ip_ports option.
     #[arg(long, value_parser = parse_key_val_ip)]
     map_ips: Vec<(String, String)>,
+
+    /// Store the captured packets in pcap files in the data directory
+    #[arg(long, default_value_t = false)]
+    dump_pcap: bool,
 }
 
 fn parse_key_val_ip(s: &str) -> Result<(String, String), String> {
@@ -75,6 +81,7 @@ struct ExporterOptions {
     datadir: PathBuf,
     mask_ip_ports: bool,
     map_ips: HashMap<IpAddr, IpAddr>,
+    dump_pcap: bool,
 }
 
 fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error>> {
@@ -117,6 +124,7 @@ fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error
         datadir,
         mask_ip_ports: args.mask_ip_ports,
         map_ips,
+        dump_pcap: args.dump_pcap,
     })
 }
 
@@ -177,6 +185,26 @@ fn get_counter<T: MetricVecBuilder>(
     generic_counter.with(&labels)
 }
 
+fn get_capture_savefile<T: pcap::State + ?Sized + pcap::Activated>(
+    capture: &Capture<T>,
+    pcap_path: &Path,
+) -> Result<Savefile, Box<dyn Error>> {
+    {
+        let res = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(pcap_path);
+
+        match res {
+            // Throw the error if it's not AlreadyExists
+            Err(e) if e.kind() != io::ErrorKind::AlreadyExists => Err(e),
+            _ => Ok(()),
+        }?
+    }
+
+    Ok(capture.savefile_append(pcap_path)?)
+}
+
 struct Exporter<'a> {
     registry: Registry,
     ntm_bytes: IntCounterVec,
@@ -231,83 +259,75 @@ impl<'a> Exporter<'a> {
             .buffer_size(CAPTURE_BUFFER_SIZE_BYTES)
             .open()?;
 
+        // ATTENTION: Apply the filter as soon as possible
         if let Some(bpf) = &opts.bpf {
             capture.filter(bpf, true)?;
         }
 
-        let mut last_write = get_time();
-        // Subtract so we immediately force a write
-        last_write -= Duration::from_millis(self.metrics_update_interval_ms);
+        let mut savefile = if opts.dump_pcap {
+            let pcap_path = opts.datadir.join(PCAP_FILE);
+            Some(get_capture_savefile(&capture, &pcap_path).unwrap())
+        } else {
+            None
+        };
 
-        println!("Starting capture");
+        let mut last_write = get_time();
+        // Subtract to immediately force a write
+        last_write -= Duration::from_millis(self.metrics_update_interval_ms);
 
         while let Ok(packet) = capture.next_packet() {
             println!("received packet!");
-            if let Ok(val) = SlicedPacket::from_ethernet(packet.data) {
-                let Some(Tcp(tcp)) = val.transport else {
-                    continue;
-                };
+            let Ok(val) = SlicedPacket::from_ethernet(packet.data) else {
+                println!("can't parse ethernet");
+                continue;
+            };
+            let Some(Tcp(tcp)) = val.transport else {
+                continue;
+            };
 
-                let (src_ip, src_port, dst_ip, dst_port) = match val.net {
-                    Some(Ipv4(ip)) => {
-                        let src_port = tcp.source_port();
-                        let dst_port = tcp.destination_port();
+            if let Some(savefile) = &mut savefile {
+                savefile.write(&packet);
+            }
 
-                        let header = ip.header();
-                        if opts.mask_ip_ports {
-                            let src_ip = header.source_addr();
-                            let dst_ip = header.destination_addr();
+            let (src_ip, src_port, dst_ip, dst_port) = match val.net {
+                Some(Ipv4(ip)) => {
+                    let src_port = tcp.source_port();
+                    let dst_port = tcp.destination_port();
 
-                            let (mut masked_src_ip, mut masked_src_port) = (src_ip, src_port);
-                            if let Some(IpAddr::V4(mapped_ip)) =
-                                opts.map_ips.get(&IpAddr::from(src_ip))
-                            {
-                                masked_src_ip = *mapped_ip;
-                                if opts.mask_ip_ports {
-                                    masked_src_port = port_mask.apply(src_port);
-                                }
-                            } else if opts.mask_ip_ports {
-                                (masked_src_ip, masked_src_port) =
-                                    ipv4_mask.apply(src_ip, src_port);
+                    let header = ip.header();
+                    if opts.mask_ip_ports {
+                        let src_ip = header.source_addr();
+                        let dst_ip = header.destination_addr();
+
+                        let (mut masked_src_ip, mut masked_src_port) = (src_ip, src_port);
+                        if let Some(IpAddr::V4(mapped_ip)) = opts.map_ips.get(&IpAddr::from(src_ip))
+                        {
+                            masked_src_ip = *mapped_ip;
+                            if opts.mask_ip_ports {
+                                masked_src_port = port_mask.apply(src_port);
                             }
-
-                            let (mut masked_dst_ip, mut masked_dst_port) = (dst_ip, dst_port);
-                            if let Some(IpAddr::V4(mapped_ip)) =
-                                opts.map_ips.get(&IpAddr::from(dst_ip))
-                            {
-                                masked_dst_ip = *mapped_ip;
-                                if opts.mask_ip_ports {
-                                    masked_dst_port = port_mask.apply(dst_port);
-                                }
-                            } else if opts.mask_ip_ports {
-                                (masked_dst_ip, masked_dst_port) =
-                                    ipv4_mask.apply(dst_ip, dst_port);
-                            }
-
-                            (
-                                masked_src_ip.to_string(),
-                                masked_src_port,
-                                masked_dst_ip.to_string(),
-                                masked_dst_port,
-                            )
-                        } else {
-                            (
-                                header.source_addr().to_string(),
-                                src_port,
-                                header.destination_addr().to_string(),
-                                dst_port,
-                            )
-                        }
-                    }
-                    Some(Ipv6(ip)) => {
-                        let src_port = tcp.source_port();
-                        let dst_port = tcp.destination_port();
-
-                        let header = ip.header();
-                        if opts.mask_ip_ports {
-                            panic!("Mask not supported for IPv6");
+                        } else if opts.mask_ip_ports {
+                            (masked_src_ip, masked_src_port) = ipv4_mask.apply(src_ip, src_port);
                         }
 
+                        let (mut masked_dst_ip, mut masked_dst_port) = (dst_ip, dst_port);
+                        if let Some(IpAddr::V4(mapped_ip)) = opts.map_ips.get(&IpAddr::from(dst_ip))
+                        {
+                            masked_dst_ip = *mapped_ip;
+                            if opts.mask_ip_ports {
+                                masked_dst_port = port_mask.apply(dst_port);
+                            }
+                        } else if opts.mask_ip_ports {
+                            (masked_dst_ip, masked_dst_port) = ipv4_mask.apply(dst_ip, dst_port);
+                        }
+
+                        (
+                            masked_src_ip.to_string(),
+                            masked_src_port,
+                            masked_dst_ip.to_string(),
+                            masked_dst_port,
+                        )
+                    } else {
                         (
                             header.source_addr().to_string(),
                             src_port,
@@ -315,19 +335,27 @@ impl<'a> Exporter<'a> {
                             dst_port,
                         )
                     }
-                    _ => {
-                        continue;
-                    }
-                };
-
-                let cnt_bytes = get_counter(&self.ntm_bytes, src_ip, src_port, dst_ip, dst_port);
-                cnt_bytes.inc_by(tcp.payload().len() as u64);
-
-                let curr_time = get_time();
-                if curr_time - last_write > Duration::from_millis(self.metrics_update_interval_ms) {
-                    self.write_metrics();
-                    last_write = curr_time;
                 }
+                Some(Ipv6(ip)) => {
+                    let src_port = tcp.source_port();
+                    let dst_port = tcp.destination_port();
+
+                    let header = ip.header();
+                    if opts.mask_ip_ports {
+                        panic!("Mask not supported for IPv6");
+                    }
+
+                    (
+                        header.source_addr().to_string(),
+                        src_port,
+                        header.destination_addr().to_string(),
+                        dst_port,
+                    )
+                }
+                _ => {
+                    continue;
+                }
+                &opts.extra_labels,
             }
         }
 
