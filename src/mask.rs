@@ -129,7 +129,7 @@ impl PortMask {
         };
 
         let mut enc_pairs: Vec<_> = chunks
-            .into_iter()
+            .iter()
             .enumerate()
             .map(|(i, block)| (block, i as u16))
             .collect();

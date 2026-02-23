@@ -18,7 +18,6 @@ use etherparse::{
     SlicedPacket,
     TransportSlice::Tcp,
 };
-use getrandom;
 use pcap::{Capture, Device};
 use prometheus::{
     Encoder, IntCounterVec, Opts, Registry, TextEncoder,
@@ -115,9 +114,9 @@ fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error
     Ok(ExporterOptions {
         device: device.clone(),
         bpf: args.filter.clone(),
-        datadir: datadir,
+        datadir,
         mask_ip_ports: args.mask_ip_ports,
-        map_ips: map_ips,
+        map_ips,
     })
 }
 
@@ -134,7 +133,7 @@ fn get_seed(opts: &ExporterOptions) -> Seed {
     let mut seed: Seed = [0u8; 64];
     getrandom::fill(&mut seed).unwrap();
 
-    fs::write(&seed_path, &seed).unwrap();
+    fs::write(&seed_path, seed).unwrap();
 
     seed
 }
@@ -145,7 +144,7 @@ fn get_time() -> Duration {
 
 fn list_interfaces() -> Result<(), Box<dyn Error>> {
     let devices = Device::list()?;
-    if devices.len() == 0 {
+    if devices.is_empty() {
         println!("No available interfaces");
         return Ok(());
     }
@@ -156,7 +155,7 @@ fn list_interfaces() -> Result<(), Box<dyn Error>> {
         .join(" ");
     println!("Interfaces: {interfaces_str}");
 
-    return Ok(());
+    Ok(())
 }
 
 fn get_counter<T: MetricVecBuilder>(
@@ -339,7 +338,7 @@ impl<'a> Exporter<'a> {
 fn run_exporter(opts: &ExporterOptions) -> Result<(), Box<dyn Error>> {
     let exporter = Exporter::new(&opts.datadir);
 
-    exporter.live_capture(&opts)?;
+    exporter.live_capture(opts)?;
 
     Ok(())
 }
@@ -354,13 +353,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 
     let opts = validate_cli_args(&args);
     let Ok(opts) = opts else {
-        return Err(opts.unwrap_err().into());
+        return Err(opts.unwrap_err());
     };
 
     let exporter_thread = thread::spawn(move || {
-        run_exporter(&opts);
+        let _ = run_exporter(&opts);
     });
-    exporter_thread.join();
+    let _ = exporter_thread.join();
 
     Ok(())
 }
