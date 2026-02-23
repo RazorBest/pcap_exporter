@@ -1,7 +1,7 @@
 use aes::{Aes128, Aes256};
 use cts::{Encrypt, KeyIvInit};
-use sha2::Sha256;
 use hmac::{Hmac, Mac};
+use sha2::Sha256;
 use speck_cipher::Speck48_96;
 use speck_cipher::cipher::{BlockEncrypt, KeyInit};
 
@@ -18,12 +18,14 @@ impl SecretKeyHmac {
 }
 
 pub fn hmac256(key: &SecretKeyHmac, data: &[u8]) -> Vec<u8> {
-    let mut mac = <HmacSha256 as Mac>::new_from_slice(&key.data).expect("HMAC can take key of any size");
+    let mut mac =
+        <HmacSha256 as Mac>::new_from_slice(&key.data).expect("HMAC can take key of any size");
     mac.update(data);
 
     mac.finalize().into_bytes()[..].to_vec()
 }
 
+#[allow(dead_code)]
 pub fn permute_144_aes_cbccts_r10(key: &[u8], data: [u8; 18]) -> [u8; 18] {
     let key: [u8; 16] = key.try_into().expect("Wrong AES key length");
     let iv = [0x24; 16];
@@ -34,7 +36,7 @@ pub fn permute_144_aes_cbccts_r10(key: &[u8], data: [u8; 18]) -> [u8; 18] {
     for _ in 0..10 {
         let cipher = cts::CbcCs3Enc::<Aes128>::new(&key.into(), &iv.into());
         cipher.encrypt_b2b(&msg, &mut buf).unwrap();
-        msg = buf.clone();
+        msg = buf;
     }
 
     buf
@@ -50,7 +52,7 @@ pub fn permute_48_speck48_96(key: &[u8], data: [u8; 6]) -> [u8; 6] {
 }
 
 pub fn aes256_ecb(key: &[u8], data: &[u8]) -> Vec<u8> {
-    if data.len() % 16 != 0 {
+    if data.len().is_multiple_of(16) {
         panic!("ECB can only encrypt messages whose length that are multiple of block length");
     }
     let key: [u8; 32] = key.try_into().expect("Wrong AES key length");
@@ -58,7 +60,7 @@ pub fn aes256_ecb(key: &[u8], data: &[u8]) -> Vec<u8> {
 
     let mut enc = data.to_vec();
     for i in (0..data.len()).step_by(16) {
-        cipher.encrypt_block((&mut enc[i..i+16]).into());
+        cipher.encrypt_block((&mut enc[i..i + 16]).into());
     }
 
     enc
