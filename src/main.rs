@@ -67,10 +67,19 @@ struct CliOptions {
     /// Store the captured packets in pcap files in the data directory
     #[arg(long, default_value_t = false)]
     dump_pcap: bool,
+
+    /// Adds the constant LABEL=VALUE to all the metrics
+    #[arg(long = "add-label", value_parser = parse_key_val_label)]
+    extra_labels: Vec<(String, String)>,
 }
 
 fn parse_key_val_ip(s: &str) -> Result<(String, String), String> {
     let (k, v) = s.split_once('=').ok_or("expected IP1=IP2")?;
+    Ok((k.to_string(), v.to_string()))
+}
+
+fn parse_key_val_label(s: &str) -> Result<(String, String), String> {
+    let (k, v) = s.split_once('=').ok_or("expected LABEL=VALUE")?;
     Ok((k.to_string(), v.to_string()))
 }
 
@@ -82,6 +91,7 @@ struct ExporterOptions {
     mask_ip_ports: bool,
     map_ips: HashMap<IpAddr, IpAddr>,
     dump_pcap: bool,
+    extra_labels: Vec<(String, String)>,
 }
 
 fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error>> {
@@ -125,6 +135,7 @@ fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error
         mask_ip_ports: args.mask_ip_ports,
         map_ips,
         dump_pcap: args.dump_pcap,
+        extra_labels: args.extra_labels.clone(),
     })
 }
 
@@ -172,6 +183,7 @@ fn get_counter<T: MetricVecBuilder>(
     src_port: u16,
     dst_ip: String,
     dst_port: u16,
+    extra_labels: &[(String, String)],
 ) -> T::M {
     let labels: HashMap<_, _> = [
         ("src_ip", src_ip),
@@ -180,6 +192,11 @@ fn get_counter<T: MetricVecBuilder>(
         ("dst_port", dst_port.to_string()),
     ]
     .into_iter()
+    .chain(
+        extra_labels
+            .iter()
+            .map(|(label, value)| (&label[..], value.clone())),
+    )
     .collect();
 
     generic_counter.with(&labels)
@@ -213,11 +230,14 @@ struct Exporter<'a> {
 }
 
 impl<'a> Exporter<'a> {
-    fn new(datadir: &'a Path) -> Self {
+    fn new(datadir: &'a Path, extra_labels: &[(String, String)]) -> Self {
         let counter_opts = Opts::new("ntm_bytes", "packet bytes counter");
+        let ntm_bytes_labels: Vec<&str> = ["src_ip", "dst_ip", "src_port", "dst_port"]
+            .into_iter()
+            .chain(extra_labels.iter().map(|(key, _)| &key[..]))
+            .collect();
         let ntm_bytes_generic_counter =
-            IntCounterVec::new(counter_opts, &["src_ip", "dst_ip", "src_port", "dst_port"])
-                .unwrap();
+            IntCounterVec::new(counter_opts, &ntm_bytes_labels).unwrap();
 
         let registry = Registry::new();
         registry
@@ -278,7 +298,7 @@ impl<'a> Exporter<'a> {
         while let Ok(packet) = capture.next_packet() {
             println!("received packet!");
             let Ok(val) = SlicedPacket::from_ethernet(packet.data) else {
-                println!("can't parse ethernet");
+                println!("Can't parse ethernet");
                 continue;
             };
             let Some(Tcp(tcp)) = val.transport else {
@@ -355,7 +375,22 @@ impl<'a> Exporter<'a> {
                 _ => {
                     continue;
                 }
+            };
+
+            let cnt_bytes = get_counter(
+                &self.ntm_bytes,
+                src_ip,
+                src_port,
+                dst_ip,
+                dst_port,
                 &opts.extra_labels,
+            );
+            cnt_bytes.inc_by(tcp.payload().len() as u64);
+
+            let curr_time = get_time();
+            if curr_time - last_write >= Duration::from_millis(self.metrics_update_interval_ms) {
+                self.write_metrics();
+                last_write = curr_time;
             }
         }
 
@@ -364,7 +399,7 @@ impl<'a> Exporter<'a> {
 }
 
 fn run_exporter(opts: &ExporterOptions) -> Result<(), Box<dyn Error>> {
-    let exporter = Exporter::new(&opts.datadir);
+    let exporter = Exporter::new(&opts.datadir, &opts.extra_labels);
 
     exporter.live_capture(opts)?;
 
