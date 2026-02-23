@@ -26,6 +26,9 @@ pub fn hmac256(key: &SecretKeyHmac, data: &[u8]) -> Vec<u8> {
 }
 
 #[allow(dead_code)]
+/// Uses AES CTS (ciphertext stealing) to perform a permutation of a 144 bit value
+/// AES CTS by itself is length preserving and bijective. However, it's not a PRP.
+/// Adding more rounds makes it closer to a PRP.
 pub fn permute_144_aes_cbccts_r10(key: &[u8], data: [u8; 18]) -> [u8; 18] {
     let key: [u8; 16] = key.try_into().expect("Wrong AES key length");
     let iv = [0x24; 16];
