@@ -50,6 +50,7 @@ struct CliOptions {
     list: bool,
 
     /// Barkley-Packet-Filter, similar to tcpdump
+    #[arg(short, long)]
     filter: Option<String>,
 
     /// Directory for storing data across runs
