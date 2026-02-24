@@ -335,7 +335,6 @@ impl<'a> Exporter<'a> {
                 break;
             }
 
-            println!("received packet!");
             let Ok(val) = SlicedPacket::from_ethernet(packet.data) else {
                 println!("Can't parse ethernet");
                 continue;
