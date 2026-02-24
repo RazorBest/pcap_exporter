@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use axum::Router;
 use clap::Parser;
 use etherparse::{
     InternetSlice::{Ipv4, Ipv6},
@@ -26,6 +27,7 @@ use prometheus::{
     Encoder, IntCounterVec, Opts, Registry, TextEncoder,
     core::{MetricVec, MetricVecBuilder},
 };
+use tower_http::services::ServeFile;
 
 use crate::mask::{Ipv4PortMask, PortMask, Seed};
 
@@ -36,6 +38,8 @@ const HTML_DIR: &str = "html";
 const SEED_FILE: &str = "seed";
 const PCAP_FILE: &str = "captured.pcap";
 const DEFAULT_METRICS_UPDATE_INTERVAL_MS: u64 = 100;
+const DEFAULT_HOST: &str = "127.0.0.1";
+const DEFAULT_PORT: u16 = 8000;
 
 #[derive(Parser)]
 #[command(name = "pcap_exporter")]
@@ -74,6 +78,14 @@ struct CliOptions {
     /// Adds the constant LABEL=VALUE to all the metrics
     #[arg(long = "add-label", value_parser = parse_key_val_label)]
     extra_labels: Vec<(String, String)>,
+
+    /// Local host to which the web server listens
+    #[arg(long, default_value_t = DEFAULT_HOST.to_string())]
+    host: String,
+
+    /// Port to which the web server listens
+    #[arg(long, default_value_t = DEFAULT_PORT)]
+    port: u16,
 }
 
 fn parse_key_val_ip(s: &str) -> Result<(String, String), String> {
@@ -97,7 +109,9 @@ struct ExporterOptions {
     extra_labels: Vec<(String, String)>,
 }
 
-fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error>> {
+fn validate_cli_args(
+    args: &CliOptions,
+) -> Result<(ExporterOptions, WebserverOptions), Box<dyn Error>> {
     // The error shouldn't trigger, because the case is handled by clap
     let iface = args
         .iface
@@ -131,15 +145,22 @@ fn validate_cli_args(args: &CliOptions) -> Result<ExporterOptions, Box<dyn Error
         })
         .collect::<Result<HashMap<_, _>, _>>()?;
 
-    Ok(ExporterOptions {
-        device: device.clone(),
-        bpf: args.filter.clone(),
-        datadir,
-        mask_ip_ports: args.mask_ip_ports,
-        map_ips,
-        dump_pcap: args.dump_pcap,
-        extra_labels: args.extra_labels.clone(),
-    })
+    Ok((
+        ExporterOptions {
+            device: device.clone(),
+            bpf: args.filter.clone(),
+            datadir: datadir.clone(),
+            mask_ip_ports: args.mask_ip_ports,
+            map_ips,
+            dump_pcap: args.dump_pcap,
+            extra_labels: args.extra_labels.clone(),
+        },
+        WebserverOptions {
+            datadir,
+            host: args.host.clone(),
+            port: args.port,
+        },
+    ))
 }
 
 fn get_seed(opts: &ExporterOptions) -> Seed {
@@ -424,6 +445,49 @@ fn run_exporter(opts: &ExporterOptions, running: Arc<AtomicBool>) -> Result<(), 
     Ok(())
 }
 
+#[derive(Debug)]
+struct WebserverOptions {
+    host: String,
+    port: u16,
+    datadir: PathBuf,
+}
+
+impl WebserverOptions {
+    fn get_host_port(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+}
+
+async fn async_webserver(opts: WebserverOptions, running: Arc<AtomicBool>) {
+    let metrics_path = opts.datadir.join(HTML_DIR).join("index.html");
+    let app = Router::new().route_service("/metrics", ServeFile::new(metrics_path));
+    let listener = tokio::net::TcpListener::bind(opts.get_host_port())
+        .await
+        .unwrap();
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal(running))
+        .await
+        .unwrap();
+}
+
+async fn shutdown_signal(running: Arc<AtomicBool>) {
+    loop {
+        if !running.load(Ordering::SeqCst) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+fn run_webserver(opts: WebserverOptions, running: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
+    let rt = tokio::runtime::Runtime::new().unwrap();
+
+    rt.block_on(async_webserver(opts, running));
+
+    Ok(())
+}
+
 /// Adds a Ctrl+C handler that changes the "running" variable to false when the
 /// signal is received. This variable can be shared by other parts of the code,
 /// in order to handle exiting gracefully. The second Ctrl+C generates an exit.
@@ -456,17 +520,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let opts = validate_cli_args(&args);
-    let Ok(opts) = opts else {
+    let Ok((exporter_opts, webserver_opts)) = opts else {
         return Err(opts.unwrap_err());
     };
 
     let running = Arc::new(AtomicBool::new(true));
+    let exporter_running = running.clone();
     set_ctrlc_handler(&running);
 
     let exporter_thread = thread::spawn(move || {
-        let _ = run_exporter(&opts, running);
+        let _ = run_exporter(&exporter_opts, exporter_running);
     });
+    let webserver_thread = thread::spawn(move || {
+        let _ = run_webserver(webserver_opts, running);
+    });
+
     let _ = exporter_thread.join();
+    let _ = webserver_thread.join();
 
     Ok(())
 }
