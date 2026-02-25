@@ -770,6 +770,7 @@ dependencies = [
  "etherparse",
  "getrandom",
  "hmac",
+ "mime",
  "pcap",
  "pkg-config",
  "prometheus",
