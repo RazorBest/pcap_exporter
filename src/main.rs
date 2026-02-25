@@ -459,7 +459,10 @@ impl WebserverOptions {
 
 async fn async_webserver(opts: WebserverOptions, running: Arc<AtomicBool>) {
     let metrics_path = opts.datadir.join(HTML_DIR).join("index.html");
-    let app = Router::new().route_service("/metrics", ServeFile::new(metrics_path));
+    let app = Router::new().route_service(
+        "/metrics",
+        ServeFile::new_with_mime(metrics_path, &mime::Mime::from_str("text/plain").unwrap()),
+    );
     let listener = tokio::net::TcpListener::bind(opts.get_host_port())
         .await
         .unwrap();
