@@ -8,6 +8,10 @@ perform live packet capture.
 The appropriate pcap library needs to be installed (e.g. libpcap-dev for Debian).
 For that, follow the `Installing dependecies` section of: https://github.com/rust-pcap/pcap.
 
+# Installing libnetfilter_queue
+
+sudo apt-get install libnetfilter-queue-dev
+
 # Development
 
 ## Prek for pre-commit
