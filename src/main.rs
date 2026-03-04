@@ -1,4 +1,5 @@
 mod crypto;
+mod intercept;
 mod mask;
 
 use std::collections::HashMap;
@@ -29,6 +30,7 @@ use prometheus::{
 };
 use tower_http::services::ServeFile;
 
+use crate::intercept::{InterceptorOptions, run_intercept_exporter};
 use crate::mask::{Ipv4PortMask, PortMask, Seed};
 
 // About 10 MBs
@@ -40,6 +42,7 @@ const PCAP_FILE: &str = "captured.pcap";
 const DEFAULT_METRICS_UPDATE_INTERVAL_MS: u64 = 100;
 const DEFAULT_HOST: &str = "127.0.0.1";
 const DEFAULT_PORT: u16 = 8000;
+const DEFAULT_NFQUEUE_NUM: u16 = 0;
 
 #[derive(Parser)]
 #[command(name = "pcap_exporter")]
@@ -86,6 +89,14 @@ struct CliOptions {
     /// Port to which the web server listens
     #[arg(long, default_value_t = DEFAULT_PORT)]
     port: u16,
+
+    /// Enable active packet interception
+    #[arg(long, default_value_t = false)]
+    intercept_mode: bool,
+
+    /// nfqueue id used by the interceptor; must match the id in the corresponding iptables rule
+    #[arg(long, default_value_t = DEFAULT_NFQUEUE_NUM)]
+    queue_num: u16,
 }
 
 fn parse_key_val_ip(s: &str) -> Result<(String, String), String> {
@@ -111,7 +122,7 @@ struct ExporterOptions {
 
 fn validate_cli_args(
     args: &CliOptions,
-) -> Result<(ExporterOptions, WebserverOptions), Box<dyn Error>> {
+) -> Result<(ExporterOptions, InterceptorOptions, WebserverOptions), Box<dyn Error>> {
     // The error shouldn't trigger, because the case is handled by clap
     let iface = args
         .iface
@@ -154,6 +165,10 @@ fn validate_cli_args(
             map_ips,
             dump_pcap: args.dump_pcap,
             extra_labels: args.extra_labels.clone(),
+        },
+        InterceptorOptions {
+            _iface: iface.to_string(),
+            queue_num: args.queue_num,
         },
         WebserverOptions {
             datadir,
@@ -326,7 +341,7 @@ impl<'a> Exporter<'a> {
         last_write -= Duration::from_millis(self.metrics_update_interval_ms);
 
         while let Ok(packet) = capture.next_packet() {
-            // This part should be as fast as possible. It was triggered by the user requesting the
+            // Handling stopping should be as quick as possible. It was triggered by the user requesting the
             // program to stop.
             if !running.load(Ordering::SeqCst) {
                 if let Some(savefile) = &mut savefile {
@@ -522,7 +537,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
 
     let opts = validate_cli_args(&args);
-    let Ok((exporter_opts, webserver_opts)) = opts else {
+    let Ok((exporter_opts, interceptor_opts, webserver_opts)) = opts else {
         return Err(opts.unwrap_err());
     };
 
@@ -531,7 +546,11 @@ fn main() -> Result<(), Box<dyn Error>> {
     set_ctrlc_handler(&running);
 
     let exporter_thread = thread::spawn(move || {
-        let _ = run_exporter(&exporter_opts, exporter_running);
+        if args.intercept_mode {
+            let _ = run_intercept_exporter(&interceptor_opts, exporter_running);
+        } else {
+            let _ = run_exporter(&exporter_opts, exporter_running);
+        }
     });
     let webserver_thread = thread::spawn(move || {
         let _ = run_webserver(webserver_opts, running);
