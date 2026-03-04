@@ -3,6 +3,10 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use bitcoin::consensus::Decodable;
+use bitcoin::p2p::message::RawNetworkMessage;
+
+use etherparse::{SlicedPacket, TransportSlice::Tcp};
 use tokio::io::unix::AsyncFd;
 
 #[derive(Debug)]
@@ -58,13 +62,24 @@ impl Interceptor {
         }
     }
 
+    async fn wait_for_verdict(&mut self, running: Arc<AtomicBool>, msg: nfq::Message) {
+        tokio::select! {
+            _ = self.verdict(msg) => (),
+            _ = tokio::spawn(async move {
+                while running.load(Ordering::SeqCst) {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                }
+            }) => (),
+        }
+    }
+
     async fn live_intercept(&mut self, running: Arc<AtomicBool>) -> Result<(), Box<dyn Error>> {
         let wait_spawner = async |running: Arc<AtomicBool>| {
             while running.load(Ordering::SeqCst) {
                 tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
             }
         };
-        loop {
+        while running.load(Ordering::SeqCst) {
             let mut msg = tokio::select! {
                 msg = self.get_next_msg() => {
                     msg
@@ -76,13 +91,34 @@ impl Interceptor {
 
             msg.set_verdict(nfq::Verdict::Accept);
 
-            tokio::select! {
-                _ = self.verdict(msg) => (),
-                _ = tokio::spawn(wait_spawner(running.clone())) => {
-                    return Ok(());
-                },
+            let payload = msg.get_payload().to_vec();
+
+            let Ok(parsed) = SlicedPacket::from_ip(&payload) else {
+                println!("Can't parse IP packet: {msg:?}");
+
+                self.wait_for_verdict(running.clone(), msg).await;
+                continue;
             };
+
+            let Some(Tcp(tcp)) = parsed.transport else {
+                self.wait_for_verdict(running.clone(), msg).await;
+                continue;
+            };
+
+            let mut tcp_payload = tcp.payload();
+
+            while !tcp_payload.is_empty() {
+                let netmsg =
+                    RawNetworkMessage::consensus_decode_from_finite_reader(&mut tcp_payload)
+                        .unwrap();
+
+                println!("netmsg: {netmsg:?}");
+            }
+
+            self.wait_for_verdict(running.clone(), msg).await;
         }
+
+        Ok(())
     }
 }
 

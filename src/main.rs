@@ -341,7 +341,7 @@ impl<'a> Exporter<'a> {
         last_write -= Duration::from_millis(self.metrics_update_interval_ms);
 
         while let Ok(packet) = capture.next_packet() {
-            // This part should be as fast as possible. It was triggered by the user requesting the
+            // Handling stopping should be as quick as possible. It was triggered by the user requesting the
             // program to stop.
             if !running.load(Ordering::SeqCst) {
                 if let Some(savefile) = &mut savefile {
